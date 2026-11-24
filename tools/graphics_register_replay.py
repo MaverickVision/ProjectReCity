@@ -1,4 +1,4 @@
-"""Experimental straight-line wave64 graphics backend for the three-draw replay test ABI."""
+"""Experimental wave64 graphics backend for the three-draw replay test ABI."""
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,6 +8,42 @@ class Op:
     dest: str
     args: tuple
     symbol: str
+
+
+@dataclass
+class Conditional:
+    lhs: str
+    symbol: str
+    rhs: str
+    fallthrough: list
+    taken: list
+
+
+def live_before(block, live_out):
+    live = set(live_out)
+    for op in reversed(block):
+        if isinstance(op, Conditional):
+            live = live_before(op.fallthrough, live) | live_before(op.taken, live)
+            args = (op.lhs, op.rhs)
+        else:
+            live.discard(op.dest)
+            args = op.args
+        live.update(r for r in args if r[0] in "sv")
+    return live
+
+
+def emit_block(body, block, indent):
+    for op in block:
+        if isinstance(op, Conditional):
+            body.append(f"{indent}if ({op.lhs} {op.symbol} {op.rhs}) {{")
+            emit_block(body, op.fallthrough, indent + "    ")
+            if op.taken:
+                body.append(indent + "} else {")
+                emit_block(body, op.taken, indent + "    ")
+            body.append(indent + "}")
+        else:
+            expr = (" " + op.symbol + " ").join(op.args)
+            body.append(f"{indent}{op.dest} = {expr};")
 
 
 def generate(info, stage, unsupported):
@@ -42,6 +78,44 @@ def generate(info, stage, unsupported):
     ballots = []
     defined = {"v0", "s0"}  # Synthetic input ABI: stable invocation key and scalar seed.
     regs = set(defined)
+    indices = {ins["pc"]: idx for idx, ins in enumerate(insns)}
+
+    def forward_target(idx):
+        jump = insns[idx]
+        args = jump["args"]
+        if len(args) != 1 or args[0]["k"] != "imm" or jump["mods"] or len(jump["enc"] or "") != 8:
+            fail("expected an encoded SOPP branch displacement")
+        offset = args[0]["v"] & 0xffff
+        if offset >= 0x8000:
+            fail("backward branch")
+        target = indices.get(jump["pc"] + 4 + 4 * offset)
+        if target is None or target >= len(insns)-1:
+            fail("invalid forward branch target")
+        return target
+
+    def check_reads(rhs, incoming):
+        if any(r[0] in "sv" and r not in incoming for r in rhs):
+            fail("unsupported live-in or register undefined on a branch")
+
+    def alu(ins, incoming):
+        op = ins["op"].removesuffix("_e32").removesuffix("_e64")
+        a = ins["args"]
+        if op not in ops or ins["mods"]:
+            fail(f"unsupported ALU instruction {op}")
+        if len(a) != (3 if ops[op] else 2) or a[0]["k"] != ("vgpr" if op.startswith("v") else "sgpr"):
+            fail("invalid ALU operands")
+        dest = operand(a[0])
+        rhs = tuple(operand(x) for x in a[1:])
+        if op.startswith("s") and any(r.startswith("v") for r in rhs):
+            fail("vector source for scalar instruction")
+        check_reads(rhs, incoming)
+        incoming.add(dest)
+        regs.add(dest)
+        return Op(dest, rhs, ops[op])
+
+    comparisons = {"s_cmp_eq_u32": ("==", "!="), "s_cmp_lg_u32": ("!=", "=="),
+                   "s_cmp_ge_u32": (">=", "<"), "s_cmp_gt_u32": (">", "<="),
+                   "s_cmp_le_u32": ("<=", ">"), "s_cmp_lt_u32": ("<", ">=")}
     i = 1
     while i < len(insns)-2:
         ins = insns[i]
@@ -62,19 +136,35 @@ def generate(info, stage, unsupported):
             ballots.append(Op(dest, rhs, "!="))
             segments.append([])
             i += 2
+        elif op in comparisons:
+            jump = insns[i+1]["op"]
+            if len(ballots) != 1 or jump not in ("s_cbranch_scc0", "s_cbranch_scc1") or len(a) != 2:
+                fail("expected scalar conditional between ballots")
+            lhs, rhs = (operand(x) for x in a)
+            if lhs.startswith("v") or rhs.startswith("v"):
+                fail("expected scalar condition")
+            check_reads((lhs, rhs), defined)
+            target = forward_target(i+1)
+            end = target
+            fall_end = target
+            if target > i+2 and insns[target-1]["op"] == "s_branch":
+                end = forward_target(target-1)
+                fall_end -= 1
+            left, right = set(defined), set(defined)
+            fall = [alu(x, left) for x in insns[i+2:fall_end]]
+            taken = [alu(x, right) for x in insns[target:end]]
+            symbol = comparisons[op][int(jump == "s_cbranch_scc1")]
+            segments[-1].append(Conditional(lhs, symbol, rhs, fall, taken))
+            defined = left & right
+            i = end
+            continue
         elif op in ops:
-            if len(a) != (3 if ops[op] else 2) or a[0]["k"] != ("vgpr" if op.startswith("v") else "sgpr"):
-                fail("invalid ALU operands")
-            dest = operand(a[0])
-            rhs = tuple(operand(x) for x in a[1:])
-            if op.startswith("s") and any(r.startswith("v") for r in rhs):
-                fail("vector source for scalar instruction")
-            segments[-1].append(Op(dest, rhs, ops[op]))
+            segments[-1].append(alu(ins, defined))
             i += 1
+            continue
         else:
             fail(f"unsupported instruction {op}")
-        if any(r[0] in "sv" and r not in defined for r in rhs):
-            fail("unsupported live-in or direct mask use")
+        check_reads(rhs, defined)
         defined.add(dest)
         regs.add(dest)
     if len(ballots) != 2 or not set(outputs) <= defined:
@@ -85,9 +175,7 @@ def generate(info, stage, unsupported):
     live = set(outputs)
     cuts = [None, None]
     for phase in (2, 1, 0):
-        for op in reversed(segments[phase]):
-            live.discard(op.dest)
-            live.update(r for r in op.args if r[0] in "sv")
+        live = live_before(segments[phase], live)
         if phase:
             vote = ballots[phase-1]
             live.discard(vote.dest)
@@ -104,8 +192,7 @@ def generate(info, stage, unsupported):
             body.append(f"    {ballots[phase-1].dest} = uint(bitCount({table}[pair]) + bitCount({table}[pair+1u]));")
         else:
             body += ["    v0 = key;", "    s0 = pc.seed;"]
-        for op in segment:
-            body.append(f"    {op.dest} = {(' ' + op.symbol + ' ').join(op.args)};")
+        emit_block(body, segment, "    ")
         if phase < 2:
             for n, reg in enumerate(cuts[phase], 6):
                 body.append(f"    pc.s.data[base + {n}u] = {reg};")

@@ -15,7 +15,7 @@ import run_gpu_tests as gpu
 MASK = 2**32 - 1
 
 
-def verify(path, count, seed, killed):
+def verify(path, count, seed, killed, shape):
     words = struct.unpack("<16384I", path.read_bytes())
     halves, errors = words[:2]
     if errors or not 0 < halves <= 512:
@@ -35,20 +35,35 @@ def verify(path, count, seed, killed):
         pair = (slot//32) & ~1
         return table[pair].bit_count() + table[pair+1].bit_count()
 
+    outcomes = set()
+    merged = []
     for key, slot in enumerate(slots):
-        start = (key + seed) & MASK
+        v4 = (key + seed) & MASK
+        v5, s3 = v4 ^ 37, seed
         first = population(masks[0], slot)
-        if ((start ^ 37) + (start ^ first)) & 16:
+        if shape:
+            condition = first >= 30
+            outcomes.add(condition)
+            if (shape == "diamond" and condition) or (shape == "skip" and not condition):
+                v4 ^= first
+                s3 = 9
+            elif shape == "diamond":
+                v5 = (v5 + 5) & MASK
+        else:
+            v4 ^= first
+        merged.append((v4, v5, s3))
+        if (v4 + v5) & 16:
             masks[1][slot//32] |= 1 << (slot % 32)
     if list(words[2:1026]) != masks[0] + masks[1]:
         raise ValueError("ballot bit mismatch")
     for key, (slot, visits, *result) in enumerate(records):
-        start = (key + seed) & MASK
+        v4, v5, s3 = merged[key]
         first, second = (population(table, slot) for table in masks)
-        expected = [((start ^ first) + second) & MASK, ((61 if killed else start ^ 37) + seed) & MASK,
+        expected = [(v4 + second) & MASK, ((61 if killed else v5) + s3) & MASK,
                     first, second]
         if visits != 0x111 or result != expected:
             raise ValueError(f"key {key}: visits={visits:#x}, got {result}, expected {expected}")
+    return outcomes
 
 
 def main():
@@ -56,6 +71,7 @@ def main():
     ap.add_argument("harness", type=Path)
     ap.add_argument("work", type=Path)
     ap.add_argument("--glslang", default="glslangValidator")
+    ap.add_argument("--branches", action="store_true", help="exercise forward SCC branches between votes")
     args = ap.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -64,10 +80,14 @@ def main():
                                           "OpDecorate %in_v Location 1\nOpDecorate %in_v Flat")
     gpu.spirv_as(flat, str(work / "flat.spv"))
     for stage, extension, export in (("vs", "vert", "param1"), ("ps", "frag", "mrt0")):
-        for killed in (False, True):
-            name = f"{stage}_replay_{int(killed)}"
+        variants = [(False, "diamond"), (False, "skip")] if args.branches else [(False, ""), (True, "")]
+        for killed, shape in variants:
+            reached = set()
+            name = f"{stage}_replay_{shape or int(killed)}"
             asm = (HERE / "program.asm").read_text(encoding="ascii")
             asm += f"\nexp {export} v4, v5, v6, v7 done" + (" vm" if stage == "ps" else "") + "\ns_endpgm\n"
+            if shape:
+                asm = asm.replace("v_xor_b32_e32 v4, s10, v4", (HERE / (shape + ".asm")).read_text(encoding="ascii"))
             if killed:
                 asm = asm.replace("v_add_nc_u32_e32 v5, s3, v5", "v_mov_b32_e32 v5, 61\nv_add_nc_u32_e32 v5, s3, v5")
                 for old, new in (("s3", "s17"), ("s10", "s21"), ("v4", "v19")):
@@ -95,8 +115,12 @@ def main():
                                               str(prefix.with_suffix(".raw")), str(w), str(h)], env=env)
                     if rc:
                         raise RuntimeError(output)
-                    verify(heap, count, seed, killed)
+                    reached.update(verify(heap, count, seed, killed, shape))
                     print(f"PASS {name} {w}x{h} seed={seed} lanes={count}", flush=True)
+            if shape and reached != {False, True}:
+                raise ValueError(f"{name}: hardware inputs did not exercise both paths")
+            if shape:
+                print(f"{name}: both paths verified", flush=True)
 
 
 if __name__ == "__main__":
