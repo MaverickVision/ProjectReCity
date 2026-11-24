@@ -1,5 +1,11 @@
 # Radeon RX 5700 XT on Windows 11
 
+## Runner count correction
+
+The historical totals below reproduce the original runner output. One fixture, `cs_wavemask`, was dispatched three times and counted twice. [PR #7](https://github.com/pixl27/ProjectReCity/pull/7) executes it once and records one result. Unfiltered native and emulated runs on the same adapter with implicit layers disabled each produced **92/100 passed, 8 skipped, 0 failed**. In each mode all 102 shader modules translated and passed validation. A module count and a GPU test count measure different things.
+
+[PR #5](https://github.com/pixl27/ProjectReCity/pull/5) separately improves the diagnostics when a helper exits successfully but omits its expected result.
+
 ## Follow-up: intermittent missing output on Windows
 
 An independent invocation of `vk_compute_test.exe` for `cs_smem_soffset_imm` reproduced an exit code of zero with **empty stdout**. Stderr contained only the device identification. The test runner requires the eight result words even on a successful exit. This observation explains a missing-result failure, but does not establish that every earlier failure had the same cause.
