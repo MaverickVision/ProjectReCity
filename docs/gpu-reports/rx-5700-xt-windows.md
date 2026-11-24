@@ -1,5 +1,15 @@
 # Radeon RX 5700 XT on Windows 11
 
+## Follow-up: intermittent missing output on Windows
+
+An independent invocation of `vk_compute_test.exe` for `cs_smem_soffset_imm` reproduced an exit code of zero with **empty stdout**. Stderr contained only the device identification. The test runner requires the eight result words even on a successful exit. This observation explains a missing-result failure, but does not establish that every earlier failure had the same cause.
+
+We retained the original binaries and runner and disabled implicit Vulkan layers for the test process with `VK_LOADER_LAYERS_DISABLE=~implicit~`. The Vulkan loader diagnostic confirmed layer suppression. In four alternating batches of 220 individual compute/texture invocations, default settings lost one result in 440 invocations, while isolated runs returned all 440 results. Which individual layer or interaction is responsible remains unknown.
+
+Four additional **unfiltered** suite runs under isolation (native, emulated, native, emulated) each returned **93 passed, 8 capability skips, 0 failures**, with 102/102 shaders translated and validated. The skip reasons below were unchanged. To reproduce, use the same environment and command below in a fresh PowerShell with `$env:VK_LOADER_LAYERS_DISABLE = '~implicit~'`. This setting applies to child processes in that shell.
+
+## Original runs with default Vulkan layers
+
 Four unfiltered runs of the Project ReCity synthetic GPU suite on 2026-11-24. Each run translated and validated all 102 shaders. The same eight capability checks were skipped every time. Five distinct test cases failed once each and passed on the other run in the same mode. The cause of this variation is undetermined.
 
 | RECITY_W64_EMULATE | Run | Passed / 101 | Skipped | Failed | Failing runner entries |
