@@ -36,12 +36,21 @@ def verify(path, count, seed, killed, shape):
         return table[pair].bit_count() + table[pair+1].bit_count()
 
     outcomes = set()
+    wave_paths = {}
     merged = []
     for key, slot in enumerate(slots):
         v4 = (key + seed) & MASK
         v5, s3 = v4 ^ 37, seed
         first = population(masks[0], slot)
-        if shape == "nested":
+        if shape in ("divergent", "masked_skip"):
+            predicate = bool(v4 & 1)
+            wave_paths.setdefault(slot // 64, set()).add(predicate)
+            outcomes.add(predicate)
+            if predicate:
+                v4 = ((v4 ^ first) + 1) & MASK
+            elif shape == "divergent":
+                v5 = (v5 + 17) & MASK
+        elif shape == "nested":
             outer, inner = first >= 30, seed == 7
             outcomes.add((outer, inner))
             if outer and inner:
@@ -74,6 +83,8 @@ def verify(path, count, seed, killed, shape):
                     first, second]
         if visits != 0x111 or result != expected:
             raise ValueError(f"key {key}: visits={visits:#x}, got {result}, expected {expected}")
+    if wave_paths and not any(paths == {False, True} for paths in wave_paths.values()):
+        raise ValueError("no logical wave took both paths")
     return outcomes
 
 
@@ -83,6 +94,7 @@ def main():
     ap.add_argument("work", type=Path)
     ap.add_argument("--glslang", default="glslangValidator")
     ap.add_argument("--branches", action="store_true", help="exercise forward SCC branches between votes")
+    ap.add_argument("--divergent", action="store_true", help="exercise different EXEC paths within the same wave")
     args = ap.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -92,13 +104,19 @@ def main():
     gpu.spirv_as(flat, str(work / "flat.spv"))
     for stage, extension, export in (("vs", "vert", "param1"), ("ps", "frag", "mrt0")):
         variants = [(False, "diamond"), (False, "skip"), (False, "nested")] if args.branches else [(False, ""), (True, "")]
+        if args.divergent:
+            variants = [(False, "divergent"), (False, "masked_skip")]
         for killed, shape in variants:
             reached = set()
             name = f"{stage}_replay_{shape or int(killed)}"
             asm = (HERE / "program.asm").read_text(encoding="ascii")
             asm += f"\nexp {export} v4, v5, v6, v7 done" + (" vm" if stage == "ps" else "") + "\ns_endpgm\n"
             if shape:
-                asm = asm.replace("v_xor_b32_e32 v4, s10, v4", (HERE / (shape + ".asm")).read_text(encoding="ascii"))
+                fixture = "divergent" if shape == "masked_skip" else shape
+                body = (HERE / (fixture + ".asm")).read_text(encoding="ascii")
+                if shape == "masked_skip":
+                    body = body[:body.index("s_andn2_b64")] + body[body.index("s_mov_b64 exec"):]
+                asm = asm.replace("v_xor_b32_e32 v4, s10, v4", body)
             if killed:
                 asm = asm.replace("v_add_nc_u32_e32 v5, s3, v5", "v_mov_b32_e32 v5, 61\nv_add_nc_u32_e32 v5, s3, v5")
                 for old, new in (("s3", "s17"), ("s10", "s21"), ("v4", "v19")):

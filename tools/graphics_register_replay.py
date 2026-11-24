@@ -153,6 +153,41 @@ def generate(info, stage, unsupported):
         symbol = comparisons[cmp["op"]][int(insns[i+1]["op"] == "s_cbranch_scc1")]
         return Conditional(lhs, symbol, rhs, fall, taken), join, left & right
 
+    def masked_region(i, stop, incoming):
+        # The saved EXEC and compare mask are opaque here. Vector writes are
+        # predicated, but scalar writes would execute even with an empty EXEC.
+        cmp, save = insns[i:i+2]
+        args = cmp["args"]
+        if len(args) != 3 or len(save["args"]) != 2 or save["mods"]:
+            fail("invalid EXEC mask operands")
+        mask = args[0]
+        saved, source = save["args"]
+        def pair(a):
+            return a["k"] == "sgpr" and a["n"] == 2 and not any(a.get(f) for f in ("neg", "abs", "sext"))
+        if not pair(mask) or not pair(saved) or source != mask:
+            fail("expected SGPR mask pairs for saveexec")
+        lhs, rhs = map(operand, args[1:])
+        check_reads((lhs, rhs), incoming)
+        available = set(incoming)
+        for reg in (mask, saved):
+            available.difference_update((f"s{reg['r']}", f"s{reg['r']+1}"))
+        left, right = set(available), set(available)
+        yes, no = [], []
+        block, valid = yes, left
+        exec_reg = {"k": "special", "t": "exec", "neg": False, "abs": False}
+        for j in range(i+2, stop):
+            ins = insns[j]
+            if ins["op"] == "s_mov_b64" and ins["args"] == [exec_reg, saved] and not ins["mods"]:
+                return Conditional(lhs, "!=", rhs, yes, no), j+1, left & right
+            if (ins["op"] == "s_andn2_b64" and ins["args"] == [exec_reg, saved, exec_reg]
+                    and not ins["mods"] and block is yes):
+                block, valid = no, right
+                continue
+            if not ins["op"].startswith("v_"):
+                fail("expected vector ALU or matching EXEC switch/restore")
+            block.append(alu(ins, valid))
+        fail("missing EXEC restore")
+
     i = 1
     while i < len(insns)-2:
         ins = insns[i]
@@ -162,6 +197,12 @@ def generate(info, stage, unsupported):
             fail("instruction modifiers")
         if op == "v_cmp_ne_u32":
             count = insns[i+1]
+            if count["op"] == "s_and_saveexec_b64":
+                if len(ballots) != 1:
+                    fail("expected masked region between ballots")
+                node, i, defined = masked_region(i, len(insns)-2, defined)
+                segments[-1].append(node)
+                continue
             if (len(a) != 3 or a[0]["k"] != "sgpr" or a[0]["n"] != 2 or
                 count["op"] != "s_bcnt1_i32_b64" or count["mods"] or len(count["args"]) != 2 or
                 count["args"][1] != a[0] or count["args"][0]["k"] != "sgpr"):
