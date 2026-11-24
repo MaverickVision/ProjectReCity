@@ -55,3 +55,19 @@ def test_reject_invalid_nested_exec(make_shader, original, replacement, reason):
     shader = make_shader(asm + "\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
     with pytest.raises(rdna2spirv.Unsupported, match=reason):
         graphics_register_replay.generate(rdna2spirv.parse_file(shader.path), "ps", rdna2spirv.Unsupported)
+
+
+@requires_tools
+@pytest.mark.parametrize(("old", "new", "reason"), [
+    ("s[20:21]", "s[16:17]", "unprotected mask"),
+    ("s_bcnt1_i32_b64 s23, s[20:21]", "s_bcnt1_i32_b64 s23, s[14:15]", "matching popcount"),
+    ("v_add_nc_u32_e32 v4, s23, v4",
+     "v_cmp_ne_u32_e64 s[20:21], v22, 0\ns_bcnt1_i32_b64 s24, s[20:21]", "expected one masked"),
+])
+def test_reject_invalid_masked_ballot(make_shader, old, new, reason):
+    folder = Path(ROOT) / "runtime/test/shaders/register_replay"
+    block = (folder / "ballot_then.asm").read_text(encoding="ascii").replace(old, new)
+    asm = (folder / "program.asm").read_text(encoding="ascii").replace("v_xor_b32_e32 v4, s10, v4", block)
+    shader = make_shader(asm + "\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+    with pytest.raises(rdna2spirv.Unsupported, match=reason):
+        graphics_register_replay.generate(rdna2spirv.parse_file(shader.path), "ps", rdna2spirv.Unsupported)

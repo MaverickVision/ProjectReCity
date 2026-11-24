@@ -19,6 +19,38 @@ class Conditional:
     taken: list
 
 
+@dataclass
+class MaskedVote:
+    dest: str
+    args: tuple
+
+
+def split_masked_vote(block, regs):
+    """Partition the middle draw at its one collective, freezing the enclosing path."""
+    for i, node in enumerate(block):
+        if isinstance(node, MaskedVote):
+            mark = Conditional(node.args[0], "!=", node.args[1],
+                               [Op("v_vote", ("1u",), "")], [])
+            return block[:i] + [mark], node, block[i+1:]
+        if isinstance(node, Conditional):
+            for taken, arm in enumerate((node.fallthrough, node.taken)):
+                split = split_masked_vote(arm, regs)
+                if split is None:
+                    continue
+                before, vote, after = split
+                flag = f"v_path{len(regs)}"
+                regs.add(flag)
+                freeze = Conditional(node.lhs, node.symbol, node.rhs,
+                                     [Op(flag, ("1u",), "")], [Op(flag, ("0u",), "")])
+                # In EXEC order the fallthrough executes before the complement.
+                pre = Conditional(flag, "!=", "0u", node.fallthrough if taken else before,
+                                  before if taken else [])
+                post = Conditional(flag, "!=", "0u", [] if taken else after,
+                                   after if taken else node.taken)
+                return block[:i] + [freeze, pre], vote, [post] + block[i+1:]
+    return None
+
+
 def live_before(block, live_out):
     live = set(live_out)
     for op in reversed(block):
@@ -153,6 +185,8 @@ def generate(info, stage, unsupported):
         symbol = comparisons[cmp["op"]][int(insns[i+1]["op"] == "s_cbranch_scc1")]
         return Conditional(lhs, symbol, rhs, fall, taken), join, left & right
 
+    masked_counts = set()
+
     def masked_region(i, stop, incoming, saved_stack, clobbered):
         # The saved EXEC and compare mask are opaque here. Vector writes are
         # predicated, but scalar writes would execute even with an empty EXEC.
@@ -169,14 +203,16 @@ def generate(info, stage, unsupported):
         def words(reg):
             return {f"s{reg['r']}", f"s{reg['r']+1}"}
         writes = words(mask) | words(saved)
+        if writes & masked_counts:
+            fail("mask clobbers masked ballot result")
         if writes & saved_stack:
             fail("nested mask overwrites live saved EXEC")
         lhs, rhs = map(operand, args[1:])
-        check_reads((lhs, rhs), incoming - clobbered)
+        check_reads((lhs, rhs), (incoming | masked_counts) - clobbered)
         # Mask-producing scalar registers are clobbered in instruction order,
         # including for lanes taking the complementary arm.
         clobbered.update(writes)
-        available = incoming - clobbered
+        available = (incoming | masked_counts) - clobbered
         left, right = set(available), set(available)
         yes, no = [], []
         block, valid = yes, left
@@ -185,7 +221,7 @@ def generate(info, stage, unsupported):
         while j < stop:
             ins = insns[j]
             if ins["op"] == "s_mov_b64" and ins["args"] == [exec_reg, saved] and not ins["mods"]:
-                return Conditional(lhs, "!=", rhs, yes, no), j+1, (left & right) - clobbered
+                return Conditional(lhs, "!=", rhs, yes, no), j+1, ((left & right) | masked_counts) - clobbered
             if (ins["op"] == "s_andn2_b64" and ins["args"] == [exec_reg, saved, exec_reg]
                     and not ins["mods"] and block is yes):
                 block, valid = no, right
@@ -198,6 +234,27 @@ def generate(info, stage, unsupported):
                 valid.clear()
                 valid.update(joined)
                 continue
+            if (ins["op"] in ("v_cmp_ne_u32", "v_cmp_ne_u32_e64") and j+1 < stop
+                    and insns[j+1]["op"] == "s_bcnt1_i32_b64"):
+                args, count = ins["args"], insns[j+1]
+                if (masked_counts or ins["mods"] or count["mods"] or len(args) != 3 or not pair(args[0])
+                        or len(count["args"]) != 2 or count["args"][1] != args[0]
+                        or count["args"][0]["k"] != "sgpr"):
+                    fail("expected one masked comparison and matching popcount")
+                dest = operand(count["args"][0])
+                protected = saved_stack | words(saved)
+                if (words(args[0]) & protected or dest in protected | words(args[0]) or dest in regs):
+                    fail("masked ballot needs a fresh count register and an unprotected mask")
+                vote_args = tuple(operand(a) for a in args[1:])
+                check_reads(vote_args, valid - clobbered)
+                clobbered.update(words(args[0]))
+                clobbered.discard(dest)
+                masked_counts.add(dest)
+                regs.add(dest)
+                block.append(MaskedVote(dest, vote_args))
+                j += 2
+                continue
+            valid.update(masked_counts)
             valid.difference_update(clobbered)
             if not ins["op"].startswith("v_"):
                 fail("expected vector ALU or matching EXEC switch/restore")
@@ -251,9 +308,14 @@ def generate(info, stage, unsupported):
 
     # A vote destination becomes available on resume. Only earlier definitions
     # still needed beyond that point require scratch storage.
+    if masked_counts:
+        before, vote, after = split_masked_vote(segments[1], regs)
+        regs.add("v_vote")
+        segments[1:2] = [[Op("v_vote", ("0u",), "")] + before, after]
+        ballots.insert(1, Op(vote.dest, ("v_vote", "0u"), "!="))
     live = set(outputs)
-    cuts = [None, None]
-    for phase in (2, 1, 0):
+    cuts = [None] * len(ballots)
+    for phase in reversed(range(len(segments))):
         live = live_before(segments[phase], live)
         if phase:
             vote = ballots[phase-1]
@@ -261,7 +323,9 @@ def generate(info, stage, unsupported):
             cuts[phase-1] = sorted(live)
             live.update(r for r in vote.args if r[0] in "sv")
 
-    body = ["uint " + ", ".join(sorted(regs)) + ";"]
+    # A register live only on one nested path can still have a scratch slot on every lane.
+    declarations = [r + " = 0u" if masked_counts else r for r in sorted(regs)]
+    body = ["uint " + ", ".join(declarations) + ";"]
     for phase, segment in enumerate(segments):
         body.append(f"if (pc.phase == {phase}u) {{")
         if phase:
@@ -272,7 +336,7 @@ def generate(info, stage, unsupported):
         else:
             body += ["    v0 = key;", "    s0 = pc.seed;"]
         emit_block(body, segment, "    ")
-        if phase < 2:
+        if phase < len(ballots):
             for n, reg in enumerate(cuts[phase], 6):
                 body.append(f"    pc.s.data[base + {n}u] = {reg};")
             a, b = ballots[phase].args
@@ -285,4 +349,5 @@ def generate(info, stage, unsupported):
     template = Path(__file__).with_suffix(".glsl").read_text(encoding="ascii")
     if stage == "vs":
         template = template.replace("#version 460", "#version 460\n#define VERTEX_STAGE")
+    template = template.replace("N_BALLOTS", str(len(ballots))).replace("DATA_WORDS", str(16384 - 2 - 512 * len(ballots)) + "u")
     return template.replace("STRIDE", f"{6 + max(map(len,cuts))}u").replace("// GENERATED_BODY", "\n    ".join(body))

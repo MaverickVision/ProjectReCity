@@ -4,7 +4,7 @@
 #extension GL_EXT_buffer_reference : require
 layout(buffer_reference, std430, buffer_reference_align=4) buffer Scratch {
     uint halves, errors;
-    uint votes[2][512];
+    uint votes[N_BALLOTS][512];
     uint data[];
 };
 layout(push_constant) uniform Params {
@@ -26,7 +26,7 @@ void main() {
     if (gl_HelperInvocation) return;
 #endif
     result = vec4(-1);
-    if (gl_SubgroupSize != 32u || id >= pc.count || pc.count > 15358u / STRIDE) {
+    if (gl_SubgroupSize != 32u || id >= pc.count || pc.count > DATA_WORDS / STRIDE) {
         atomicAdd(pc.s.errors, 1u);
         return;
     }

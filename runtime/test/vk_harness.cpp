@@ -261,7 +261,11 @@ int main(int argc, char** argv) {
     uint32_t replay_vertices = 3;
     VkPipelineStageFlags replay_access = 0;
     VkPhysicalDeviceFeatures feats{};
+    uint32_t replay_passes = 2;
     if (replay_stage) {
+        if (const char* passes = std::getenv("VKH_BALLOT_PASSES")) {
+            if (!parse_u32(passes, replay_passes) || *passes || (replay_passes != 2 && replay_passes != 3)) return 2;
+        }
         if (!heap_env || mesh || gs_path || clip_shifts) return 2;
         if (!std::strcmp(replay_stage, "vs")) {
             if (!f2q.features.vertexPipelineStoresAndAtomics) return 77;
@@ -498,7 +502,7 @@ int main(int argc, char** argv) {
         LOADD(vkCmdPushConstants);
         LOADD(vkCmdPipelineBarrier);
         // Draw one physical half per pass, with a device-side dependency before reading the shared heap.
-        for (uint32_t phase = 0; phase < 2; ++phase) {
+        for (uint32_t phase = 0; phase < replay_passes; ++phase) {
             pc[0] = phase;
             vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -511,7 +515,7 @@ int main(int argc, char** argv) {
             const auto stages = replay_access | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             vkCmdPipelineBarrier(cmd, stages, stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
         }
-        pc[0] = 2;
+        pc[0] = replay_passes;
     }
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     if (group_readback) {
