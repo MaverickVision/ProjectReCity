@@ -110,9 +110,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
         return 2;
     }
+    const char* heap_dump = std::getenv("VKH_HEAP_DUMP");
+    void* heap_mapping = nullptr;
     const uint32_t heap_bytes = 64 * 1024;
     const char* heap_env = std::getenv("VKH_HEAP");
     if (heap_env && !*heap_env) heap_env = nullptr;
+    if (heap_dump && !heap_env) return 2;
     std::vector<std::pair<uint32_t, uint32_t>> heap_words;
     if (heap_env && !parse_heap(heap_env, heap_words, heap_bytes)) {
         std::fprintf(stderr, "VKH_HEAP: expected addr=word pairs, 4-byte aligned below 0x%x, got \"%s\"\n",
@@ -472,6 +475,7 @@ int main(int argc, char** argv) {
         VkDeviceMemory hmem; CHECK(vkAllocateMemory(dev, &hai, nullptr, &hmem));
         CHECK(vkBindBufferMemory(dev, heap, hmem, 0));
         void* hp; CHECK(vkMapMemory(dev, hmem, 0, heap_bytes, 0, &hp));
+        heap_mapping = hp;
         std::memset(hp, 0, heap_bytes);
         for (auto [addr, word] : heap_words) std::memcpy(static_cast<char*>(hp) + addr, &word, 4);
         VkBufferDeviceAddressInfo hda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -530,15 +534,29 @@ int main(int argc, char** argv) {
     if (mesh)
         reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT"))(cmd, groups[0], groups[1], groups[2]);
     else
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdDraw(cmd, replay_vertices, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    if (heap_dump) {
+        LOADD(vkCmdPipelineBarrier);
+        VkMemoryBarrier visible{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        visible.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        visible.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &visible, 0, nullptr, 0, nullptr);
+    }
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
     void* p; CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
+    if (heap_dump) {
+        std::ofstream dump(heap_dump, std::ios::binary);
+        dump.write(static_cast<const char*>(heap_mapping), heap_bytes);
+        dump.close();
+        if (!dump) return 1;
+    }
     std::ofstream output(argv[3], std::ios::binary);
     output.write(static_cast<const char*>(p), std::streamsize(bi.size));
     output.close();
