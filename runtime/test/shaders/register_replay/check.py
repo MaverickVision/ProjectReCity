@@ -41,7 +41,18 @@ def verify(path, count, seed, killed, shape):
         v4 = (key + seed) & MASK
         v5, s3 = v4 ^ 37, seed
         first = population(masks[0], slot)
-        if shape:
+        if shape == "nested":
+            outer, inner = first >= 30, seed == 7
+            outcomes.add((outer, inner))
+            if outer and inner:
+                s3 = 9
+            elif outer:
+                v4 ^= first
+            elif inner:
+                s3 = 17
+            else:
+                v5 = (v5 + 5) & MASK
+        elif shape:
             condition = first >= 30
             outcomes.add(condition)
             if (shape == "diamond" and condition) or (shape == "skip" and not condition):
@@ -80,7 +91,7 @@ def main():
                                           "OpDecorate %in_v Location 1\nOpDecorate %in_v Flat")
     gpu.spirv_as(flat, str(work / "flat.spv"))
     for stage, extension, export in (("vs", "vert", "param1"), ("ps", "frag", "mrt0")):
-        variants = [(False, "diamond"), (False, "skip")] if args.branches else [(False, ""), (True, "")]
+        variants = [(False, "diamond"), (False, "skip"), (False, "nested")] if args.branches else [(False, ""), (True, "")]
         for killed, shape in variants:
             reached = set()
             name = f"{stage}_replay_{shape or int(killed)}"
@@ -117,10 +128,11 @@ def main():
                         raise RuntimeError(output)
                     reached.update(verify(heap, count, seed, killed, shape))
                     print(f"PASS {name} {w}x{h} seed={seed} lanes={count}", flush=True)
-            if shape and reached != {False, True}:
-                raise ValueError(f"{name}: hardware inputs did not exercise both paths")
             if shape:
-                print(f"{name}: both paths verified", flush=True)
+                required = {(a,b) for a in (False, True) for b in (False, True)} if shape == "nested" else {False, True}
+                if reached != required:
+                    raise ValueError(f"{name}: missing paths {required - reached}")
+                print(f"{name}: {len(reached)} paths verified", flush=True)
 
 
 if __name__ == "__main__":

@@ -116,6 +116,43 @@ def generate(info, stage, unsupported):
     comparisons = {"s_cmp_eq_u32": ("==", "!="), "s_cmp_lg_u32": ("!=", "=="),
                    "s_cmp_ge_u32": (">=", "<"), "s_cmp_gt_u32": (">", "<="),
                    "s_cmp_le_u32": ("<=", ">"), "s_cmp_lt_u32": ("<", ">=")}
+
+    def arm(start, stop, incoming):
+        block = []
+        defined = set(incoming)
+        i = start
+        while i < stop:
+            if insns[i]["op"] in comparisons:
+                node, i, defined = conditional(i, stop, defined)
+                block.append(node)
+            else:
+                block.append(alu(insns[i], defined))
+                i += 1
+        return block, defined
+
+    def conditional(i, stop, incoming):
+        cmp = insns[i]
+        if (i+1 >= stop or cmp["mods"] or len(cmp["args"]) != 2 or
+                insns[i+1]["op"] not in ("s_cbranch_scc0", "s_cbranch_scc1")):
+            fail("expected scalar comparison and conditional jump in the same arm")
+        lhs, rhs = (operand(x) for x in cmp["args"])
+        if lhs.startswith("v") or rhs.startswith("v"):
+            fail("expected scalar condition")
+        check_reads((lhs, rhs), incoming)
+        target = forward_target(i+1)
+        if target > stop:
+            fail("conditional jump escapes enclosing arm")
+        join = fall_end = target
+        if target > i+2 and insns[target-1]["op"] == "s_branch":
+            join = forward_target(target-1)
+            if join > stop:
+                fail("branch join escapes enclosing arm")
+            fall_end -= 1
+        fall, left = arm(i+2, fall_end, incoming)
+        taken, right = arm(target, join, incoming)
+        symbol = comparisons[cmp["op"]][int(insns[i+1]["op"] == "s_cbranch_scc1")]
+        return Conditional(lhs, symbol, rhs, fall, taken), join, left & right
+
     i = 1
     while i < len(insns)-2:
         ins = insns[i]
@@ -137,26 +174,10 @@ def generate(info, stage, unsupported):
             segments.append([])
             i += 2
         elif op in comparisons:
-            jump = insns[i+1]["op"]
-            if len(ballots) != 1 or jump not in ("s_cbranch_scc0", "s_cbranch_scc1") or len(a) != 2:
+            if len(ballots) != 1:
                 fail("expected scalar conditional between ballots")
-            lhs, rhs = (operand(x) for x in a)
-            if lhs.startswith("v") or rhs.startswith("v"):
-                fail("expected scalar condition")
-            check_reads((lhs, rhs), defined)
-            target = forward_target(i+1)
-            end = target
-            fall_end = target
-            if target > i+2 and insns[target-1]["op"] == "s_branch":
-                end = forward_target(target-1)
-                fall_end -= 1
-            left, right = set(defined), set(defined)
-            fall = [alu(x, left) for x in insns[i+2:fall_end]]
-            taken = [alu(x, right) for x in insns[target:end]]
-            symbol = comparisons[op][int(jump == "s_cbranch_scc1")]
-            segments[-1].append(Conditional(lhs, symbol, rhs, fall, taken))
-            defined = left & right
-            i = end
+            node, i, defined = conditional(i, len(insns)-2, defined)
+            segments[-1].append(node)
             continue
         elif op in ops:
             segments[-1].append(alu(ins, defined))
