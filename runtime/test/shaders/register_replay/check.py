@@ -15,13 +15,13 @@ import run_gpu_tests as gpu
 MASK = 2**32 - 1
 
 
-def verify(path, count, seed, killed, shape):
+def verify(path, count, seed, killed, shape, nested_stride=None):
     words = struct.unpack("<16384I", path.read_bytes())
     halves, errors = words[:2]
     if errors or not 0 < halves <= 512:
         raise ValueError(f"invalid capture: {halves} halves, {errors} errors")
     # This fixture needs four persistent words (three after the overwrite variant).
-    stride = 9 if killed else 10
+    stride = nested_stride or (9 if killed else 10)
     records = [words[1026+i*stride:1026+i*stride+6] for i in range(count)]
     slots = [r[0] for r in records]
     if max(slots) >= halves*32 or len(set(slots)) != count or set(s//32 for s in slots) != set(range(halves)):
@@ -38,11 +38,32 @@ def verify(path, count, seed, killed, shape):
     outcomes = set()
     wave_paths = {}
     merged = []
+    checkpoints = []
     for key, slot in enumerate(slots):
         v4 = (key + seed) & MASK
         v5, s3 = v4 ^ 37, seed
         first = population(masks[0], slot)
-        if shape in ("divergent", "masked_skip"):
+        if shape.startswith("nested_exec"):
+            outer, inner = bool(v4 & 1), bool(v4 & 2)
+            outcomes.add((outer, inner))
+            wave_paths.setdefault(slot // 64, set()).add((outer, inner))
+            if outer and inner:
+                v4 ^= first
+                leaf = 1
+            elif outer:
+                v5 = (v5 + 11) & MASK
+                leaf = 2
+            elif inner:
+                v4 = (v4 + 5) & MASK
+                leaf = 4
+            else:
+                v5 ^= 17
+                leaf = 8
+            parent_vote = bool((v4 + v5) & 16)
+            marker = leaf | (16 if outer else 32) | 64 | (128 if parent_vote else 0)
+            checkpoints.append((v4, v5, marker))
+            v4 = (v4 + 3) & MASK
+        elif shape in ("divergent", "masked_skip"):
             predicate = bool(v4 & 1)
             wave_paths.setdefault(slot // 64, set()).add(predicate)
             outcomes.add(predicate)
@@ -81,9 +102,15 @@ def verify(path, count, seed, killed, shape):
         first, second = (population(table, slot) for table in masks)
         expected = [(v4 + second) & MASK, ((61 if killed else v5) + s3) & MASK,
                     first, second]
+        if shape.startswith("nested_exec"):
+            inner_v4, inner_v5, marker = checkpoints[key]
+            expected[2] = marker
+            if shape == "nested_exec_snapshot":
+                expected[:2] = [inner_v4, inner_v5]
         if visits != 0x111 or result != expected:
             raise ValueError(f"key {key}: visits={visits:#x}, got {result}, expected {expected}")
-    if wave_paths and not any(paths == {False, True} for paths in wave_paths.values()):
+    required_paths = {(a,b) for a in (False, True) for b in (False, True)} if shape.startswith("nested_exec") else {False, True}
+    if wave_paths and required_paths not in wave_paths.values():
         raise ValueError("no logical wave took both paths")
     return outcomes
 
@@ -95,6 +122,7 @@ def main():
     ap.add_argument("--glslang", default="glslangValidator")
     ap.add_argument("--branches", action="store_true", help="exercise forward SCC branches between votes")
     ap.add_argument("--divergent", action="store_true", help="exercise different EXEC paths within the same wave")
+    ap.add_argument("--nested-exec", action="store_true", help="check two saved EXEC levels and restore checkpoints")
     args = ap.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -106,6 +134,8 @@ def main():
         variants = [(False, "diamond"), (False, "skip"), (False, "nested")] if args.branches else [(False, ""), (True, "")]
         if args.divergent:
             variants = [(False, "divergent"), (False, "masked_skip")]
+        if args.nested_exec:
+            variants = [(False, "nested_exec"), (False, "nested_exec_snapshot")]
         for killed, shape in variants:
             reached = set()
             name = f"{stage}_replay_{shape or int(killed)}"
@@ -113,6 +143,10 @@ def main():
             asm += f"\nexp {export} v4, v5, v6, v7 done" + (" vm" if stage == "ps" else "") + "\ns_endpgm\n"
             if shape:
                 fixture = "divergent" if shape == "masked_skip" else shape
+                if shape.startswith("nested_exec"):
+                    fixture = "nested_exec"
+                    exports = "v20, v21" if shape.endswith("_snapshot") else "v4, v5"
+                    asm = asm.replace(f"exp {export} v4, v5, v6, v7", f"exp {export} {exports}, v18, v7")
                 body = (HERE / (fixture + ".asm")).read_text(encoding="ascii")
                 if shape == "masked_skip":
                     body = body[:body.index("s_andn2_b64")] + body[body.index("s_mov_b64 exec"):]
@@ -130,6 +164,9 @@ def main():
             subprocess.run([args.glslang, "-V", "--target-env", "vulkan1.2", "-S", extension,
                             "-o", module, glsl], check=True)
             subprocess.run(["spirv-val", "--target-env", "vulkan1.2", module], check=True)
+            nested_stride = None
+            if shape.startswith("nested_exec"):
+                nested_stride = int(re.search(r"uint base = key \* (\d+)u;", glsl.read_text()).group(1))
             vertex, fragment = (module, work / "flat.spv") if stage == "vs" else (work / "triangle.spv", module)
             for w,h in ([(32,32)] if stage == "vs" else [(32,32),(29,23),(5,3)]):
                 count = 192 if stage == "vs" else w*h
@@ -144,10 +181,10 @@ def main():
                                               str(prefix.with_suffix(".raw")), str(w), str(h)], env=env)
                     if rc:
                         raise RuntimeError(output)
-                    reached.update(verify(heap, count, seed, killed, shape))
+                    reached.update(verify(heap, count, seed, killed, shape, nested_stride))
                     print(f"PASS {name} {w}x{h} seed={seed} lanes={count}", flush=True)
             if shape:
-                required = {(a,b) for a in (False, True) for b in (False, True)} if shape == "nested" else {False, True}
+                required = {(a,b) for a in (False, True) for b in (False, True)} if shape.startswith("nested") else {False, True}
                 if reached != required:
                     raise ValueError(f"{name}: missing paths {required - reached}")
                 print(f"{name}: {len(reached)} paths verified", flush=True)

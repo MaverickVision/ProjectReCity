@@ -40,3 +40,18 @@ def test_reject_unsupported_exec_region(make_shader, original, replacement, reas
     shader = make_shader(asm + "\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
     with pytest.raises(rdna2spirv.Unsupported, match=reason):
         graphics_register_replay.generate(rdna2spirv.parse_file(shader.path), "ps", rdna2spirv.Unsupported)
+
+@requires_tools
+@pytest.mark.parametrize(("original", "replacement", "reason"), [
+    ("s_and_saveexec_b64 s[18:19]", "s_and_saveexec_b64 s[16:17]", "overwrites live saved EXEC"),
+    ("v_cmp_ne_u32_e64 s[14:15], v19", "v_cmp_ne_u32_e64 s[16:17], v19", "expected SGPR mask pairs"),
+    ("s_mov_b64 exec, s[18:19]", "s_mov_b64 exec, s[16:17]", "matching EXEC"),
+    ("v_add_nc_u32_e32 v4, 5, v4", "v_add_nc_u32_e32 v4, s18, v4", "undefined on a branch"),
+])
+def test_reject_invalid_nested_exec(make_shader, original, replacement, reason):
+    folder = Path(ROOT) / "runtime/test/shaders/register_replay"
+    block = (folder / "nested_exec.asm").read_text(encoding="ascii").replace(original, replacement, 1)
+    asm = (folder / "program.asm").read_text(encoding="ascii").replace("v_xor_b32_e32 v4, s10, v4", block)
+    shader = make_shader(asm + "\nexp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n")
+    with pytest.raises(rdna2spirv.Unsupported, match=reason):
+        graphics_register_replay.generate(rdna2spirv.parse_file(shader.path), "ps", rdna2spirv.Unsupported)
