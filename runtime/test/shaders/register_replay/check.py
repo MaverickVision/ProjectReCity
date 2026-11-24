@@ -196,7 +196,8 @@ def main():
     ap.add_argument("--masked-ballot", action="store_true", help="check a vote under two EXEC masks")
     ap.add_argument("--multiple-ballots", action="store_true", help="check dependent votes in nested EXEC arms")
     ap.add_argument("--five-ballots", action="store_true", help="verify five dependent masked votes")
-    ap.add_argument("--long-ballots", action="store_true", help="check chains of six and ten dependent masked votes")
+    ap.add_argument("--long-ballots", nargs="*", type=int, choices=(6, 10, 16, 32), metavar="N",
+                    help="check dependent masked vote chains of the selected lengths (default: 6 and 10)")
     args = ap.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -217,8 +218,8 @@ def main():
         if args.five_ballots:
             variants = [(False, f"five_{case}_{bank}") for case in ("mixed", "empty") for bank in ("early", "late")]
         chains = {}
-        if args.long_ballots:
-            for length in (6, 10):
+        if args.long_ballots is not None:
+            for length in args.long_ballots or (6, 10):
                 for case in ("mixed", "empty"):
                     for first in range(1, length+1, 3):
                         exports = tuple(min(first+i, length) for i in range(3))
