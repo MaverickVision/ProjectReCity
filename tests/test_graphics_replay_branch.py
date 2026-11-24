@@ -62,7 +62,7 @@ def test_reject_invalid_nested_exec(make_shader, original, replacement, reason):
     ("s[20:21]", "s[16:17]", "unprotected mask"),
     ("s_bcnt1_i32_b64 s23, s[20:21]", "s_bcnt1_i32_b64 s23, s[14:15]", "matching popcount"),
     ("v_add_nc_u32_e32 v4, s23, v4",
-     "v_cmp_ne_u32_e64 s[20:21], v22, 0\ns_bcnt1_i32_b64 s24, s[20:21]", "expected one masked"),
+     ("v_cmp_ne_u32_e64 s[20:21], v22, 0\ns_bcnt1_i32_b64 s24, s[20:21]\n") * 5, "seven ballot captures"),
 ])
 def test_reject_invalid_masked_ballot(make_shader, old, new, reason):
     folder = Path(ROOT) / "runtime/test/shaders/register_replay"

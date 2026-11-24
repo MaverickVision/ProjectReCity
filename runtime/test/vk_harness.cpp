@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
     uint32_t replay_passes = 2;
     if (replay_stage) {
         if (const char* passes = std::getenv("VKH_BALLOT_PASSES")) {
-            if (!parse_u32(passes, replay_passes) || *passes || (replay_passes != 2 && replay_passes != 3)) return 2;
+            if (!parse_u32(passes, replay_passes) || *passes || replay_passes < 2 || replay_passes > 7) return 2;
         }
         if (!heap_env || mesh || gs_path || clip_shifts) return 2;
         if (!std::strcmp(replay_stage, "vs")) {

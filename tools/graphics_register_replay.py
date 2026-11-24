@@ -1,4 +1,4 @@
-"""Experimental wave64 graphics backend for the three-draw replay test ABI."""
+"""Experimental wave64 graphics backend for the multi-draw replay test ABI."""
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,7 +26,7 @@ class MaskedVote:
 
 
 def split_masked_vote(block, regs):
-    """Partition the middle draw at its one collective, freezing the enclosing path."""
+    """Partition the middle draw at its first collective, freezing the enclosing path."""
     for i, node in enumerate(block):
         if isinstance(node, MaskedVote):
             mark = Conditional(node.args[0], "!=", node.args[1],
@@ -38,16 +38,20 @@ def split_masked_vote(block, regs):
                 if split is None:
                     continue
                 before, vote, after = split
-                flag = f"v_path{len(regs)}"
-                regs.add(flag)
-                freeze = Conditional(node.lhs, node.symbol, node.rhs,
-                                     [Op(flag, ("1u",), "")], [Op(flag, ("0u",), "")])
+                if node.lhs.startswith("v_path"):
+                    # The continuation is already guarded by a saved decision.
+                    flag, prefix = node.lhs, []
+                else:
+                    flag = f"v_path{len(regs)}"
+                    regs.add(flag)
+                    prefix = [Conditional(node.lhs, node.symbol, node.rhs,
+                                          [Op(flag, ("1u",), "")], [Op(flag, ("0u",), "")])]
                 # In EXEC order the fallthrough executes before the complement.
                 pre = Conditional(flag, "!=", "0u", node.fallthrough if taken else before,
                                   before if taken else [])
                 post = Conditional(flag, "!=", "0u", [] if taken else after,
                                    after if taken else node.taken)
-                return block[:i] + [freeze, pre], vote, [post] + block[i+1:]
+                return block[:i] + prefix + [pre], vote, [post] + block[i+1:]
     return None
 
 
@@ -237,16 +241,17 @@ def generate(info, stage, unsupported):
             if (ins["op"] in ("v_cmp_ne_u32", "v_cmp_ne_u32_e64") and j+1 < stop
                     and insns[j+1]["op"] == "s_bcnt1_i32_b64"):
                 args, count = ins["args"], insns[j+1]
-                if (masked_counts or ins["mods"] or count["mods"] or len(args) != 3 or not pair(args[0])
+                if (ins["mods"] or count["mods"] or len(args) != 3 or not pair(args[0])
                         or len(count["args"]) != 2 or count["args"][1] != args[0]
                         or count["args"][0]["k"] != "sgpr"):
-                    fail("expected one masked comparison and matching popcount")
+                    fail("expected masked comparison and matching popcount")
                 dest = operand(count["args"][0])
                 protected = saved_stack | words(saved)
-                if (words(args[0]) & protected or dest in protected | words(args[0]) or dest in regs):
+                if (words(args[0]) & (protected | masked_counts) or dest in protected | words(args[0])
+                        or (dest in regs and dest not in masked_counts)):
                     fail("masked ballot needs a fresh count register and an unprotected mask")
                 vote_args = tuple(operand(a) for a in args[1:])
-                check_reads(vote_args, valid - clobbered)
+                check_reads(vote_args, (valid | masked_counts) - clobbered)
                 clobbered.update(words(args[0]))
                 clobbered.discard(dest)
                 masked_counts.add(dest)
@@ -309,10 +314,17 @@ def generate(info, stage, unsupported):
     # A vote destination becomes available on resume. Only earlier definitions
     # still needed beyond that point require scratch storage.
     if masked_counts:
-        before, vote, after = split_masked_vote(segments[1], regs)
         regs.add("v_vote")
-        segments[1:2] = [[Op("v_vote", ("0u",), "")] + before, after]
-        ballots.insert(1, Op(vote.dest, ("v_vote", "0u"), "!="))
+        middle = segments[1]
+        index = 1
+        while (split := split_masked_vote(middle, regs)) is not None:
+            # The test ABI counts visits in one four-bit nibble per draw.
+            if len(ballots) >= 7:
+                fail("at most seven ballot captures fit in the replay visit word")
+            before, vote, middle = split
+            segments[index:index+1] = [[Op("v_vote", ("0u",), "")] + before, middle]
+            ballots.insert(index, Op(vote.dest, ("v_vote", "0u"), "!="))
+            index += 1
     live = set(outputs)
     cuts = [None] * len(ballots)
     for phase in reversed(range(len(segments))):
