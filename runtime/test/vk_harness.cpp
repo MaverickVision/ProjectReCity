@@ -112,7 +112,21 @@ int main(int argc, char** argv) {
     }
     const char* heap_dump = std::getenv("VKH_HEAP_DUMP");
     void* heap_mapping = nullptr;
-    const uint32_t heap_bytes = 64 * 1024;
+    const char* replay_stage = std::getenv("VKH_BALLOT_REPLAY_STAGE");
+    uint32_t replay_passes = 2;
+    uint32_t heap_bytes = 64 * 1024;
+    if (replay_stage) {
+        if (const char* passes = std::getenv("VKH_BALLOT_PASSES")) {
+            if (!parse_u32(passes, replay_passes) || *passes || replay_passes < 2) return 2;
+        }
+        // Preserve the original lane-record space as longer programs add ballot tables.
+        if (replay_passes > 7) {
+            const uint64_t extra = uint64_t(replay_passes - 7) * 512 * sizeof(uint32_t);
+            if (extra > UINT32_MAX - heap_bytes) return 2;
+            heap_bytes += uint32_t(extra);
+        }
+        pc[34] = replay_passes;
+    }
     const char* heap_env = std::getenv("VKH_HEAP");
     if (heap_env && !*heap_env) heap_env = nullptr;
     if (heap_dump && !heap_env) return 2;
@@ -257,15 +271,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "unsupported: no geometryShader\n");
         return 77;
     }
-    const char* replay_stage = std::getenv("VKH_BALLOT_REPLAY_STAGE");
     uint32_t replay_vertices = 3;
     VkPipelineStageFlags replay_access = 0;
     VkPhysicalDeviceFeatures feats{};
-    uint32_t replay_passes = 2;
     if (replay_stage) {
-        if (const char* passes = std::getenv("VKH_BALLOT_PASSES")) {
-            if (!parse_u32(passes, replay_passes) || *passes || replay_passes < 2 || replay_passes > 7) return 2;
-        }
         if (!heap_env || mesh || gs_path || clip_shifts) return 2;
         if (!std::strcmp(replay_stage, "vs")) {
             if (!f2q.features.vertexPipelineStoresAndAtomics) return 77;

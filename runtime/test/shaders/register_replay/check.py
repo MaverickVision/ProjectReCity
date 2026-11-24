@@ -15,8 +15,22 @@ import run_gpu_tests as gpu
 MASK = 2**32 - 1
 
 
-def verify(path, count, seed, killed, shape, nested_stride=None):
-    words = struct.unpack("<16384I", path.read_bytes())
+def extend_chain(body, length, exports):
+    # Extend the complement arm, reusing its compare pair and feeding each count forward.
+    ops = []
+    for index in range(6, length + 1):
+        vector = "v22" if index % 2 == 0 else "v26"
+        ops += [f"v_cmp_ne_u32_e64 s[20:21], s{21+index}, {vector}",
+                f"s_bcnt1_i32_b64 s{22+index}, s[20:21]"]
+    ops.append(f"v_add_nc_u32_e32 v5, s{22+length}, v5")
+    body = body.replace("v_add_nc_u32_e32 v5, s27, v5", "\n".join(ops))
+    body = body[:body.index("v_mov_b32_e32 v27, s23")]
+    return body + "\n".join(f"v_mov_b32_e32 v{27+i}, s{22+n}" for i, n in enumerate(exports))
+
+
+def verify(path, count, seed, killed, shape, nested_stride=None, chain_length=0, exports=()):
+    heap_words = 16384 + max(0, chain_length - 5) * 512
+    words = struct.unpack(f"<{heap_words}I", path.read_bytes())
     halves, errors = words[:2]
     if errors or not 0 < halves <= 512:
         raise ValueError(f"invalid capture: {halves} halves, {errors} errors")
@@ -25,7 +39,7 @@ def verify(path, count, seed, killed, shape, nested_stride=None):
     masked_vote = shape.startswith("ballot_")
     five = shape.startswith("five_")
     multi = five or shape.startswith("multi_")
-    tables = 7 if five else 5 if multi else 3 if masked_vote else 2
+    tables = chain_length + 2 if chain_length else 7 if five else 5 if multi else 3 if masked_vote else 2
     base = 2 + 512 * tables
     records = [words[base+i*stride:base+i*stride+6] for i in range(count)]
     slots = [r[0] for r in records]
@@ -49,7 +63,8 @@ def verify(path, count, seed, killed, shape, nested_stride=None):
                 active = bool(x & 1) and (inner if index < 3 else not inner)
                 pred = bool(x & 4) if index == 1 else (x & 12) != population(masks[index-1], slot)
                 if five:
-                    operand = x & (32 if index in (1, 4) else 12)
+                    use_bit_5 = index in (1, 4) or (index >= 6 and index % 2 == 0)
+                    operand = x & (32 if use_bit_5 else 12)
                     pred = operand != population(masks[index-1], slot)
                 if active and pred:
                     masks[index][slot // 32] |= 1 << (slot % 32)
@@ -158,8 +173,11 @@ def verify(path, count, seed, killed, shape, nested_stride=None):
             expected[2] = population(masks[1], slot)
         if multi:
             indices = (3, 4, 5, 6) if shape.endswith("_late") else (1, 2, 3, tables-1)
+            if chain_length:
+                indices = (*exports, tables-1)
             expected = [population(masks[i], slot) for i in indices]
-        if visits != sum(1 << (4*i) for i in range(tables+1)) or result != expected:
+        expected_visits = tables + 1 if tables > 7 else sum(1 << (4*i) for i in range(tables+1))
+        if visits != expected_visits or result != expected:
             raise ValueError(f"key {key}: visits={visits:#x}, got {result}, expected {expected}")
     required_paths = {(a,b) for a in (False, True) for b in (False, True)} if shape.startswith("nested_exec") else {False, True}
     if wave_paths and required_paths not in wave_paths.values():
@@ -177,7 +195,8 @@ def main():
     ap.add_argument("--nested-exec", action="store_true", help="check two saved EXEC levels and restore checkpoints")
     ap.add_argument("--masked-ballot", action="store_true", help="check a vote under two EXEC masks")
     ap.add_argument("--multiple-ballots", action="store_true", help="check dependent votes in nested EXEC arms")
-    ap.add_argument("--five-ballots", action="store_true", help="verify five dependent masked votes at the replay limit")
+    ap.add_argument("--five-ballots", action="store_true", help="verify five dependent masked votes")
+    ap.add_argument("--long-ballots", action="store_true", help="check chains of six and ten dependent masked votes")
     args = ap.parse_args()
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -197,7 +216,16 @@ def main():
             variants = [(False, "multi_votes"), (False, "multi_empty")]
         if args.five_ballots:
             variants = [(False, f"five_{case}_{bank}") for case in ("mixed", "empty") for bank in ("early", "late")]
+        chains = {}
+        if args.long_ballots:
+            for length in (6, 10):
+                for case in ("mixed", "empty"):
+                    for first in range(1, length+1, 3):
+                        exports = tuple(min(first+i, length) for i in range(3))
+                        chains[f"five_{case}_chain{length}_from{first}"] = (length, exports)
+            variants = [(False, name) for name in chains]
         for killed, shape in variants:
+            chain_length, exports_bank = chains.get(shape, (0, ()))
             reached = set()
             name = f"{stage}_replay_{shape or int(killed)}"
             asm = (HERE / "program.asm").read_text(encoding="ascii")
@@ -218,6 +246,8 @@ def main():
                     count_exports = "v29, v30, v31" if shape.endswith("_late") else "v27, v28, v29"
                     asm = asm.replace(f"exp {export} v4, v5, v6, v7", f"exp {export} {count_exports}, v7")
                 body = (HERE / (fixture + ".asm")).read_text(encoding="ascii")
+                if chain_length:
+                    body = extend_chain(body, chain_length, exports_bank)
                 if shape == "multi_empty" or shape.startswith("five_empty_"):
                     body = body.replace("v_and_b32_e32 v19, 2, v4", "v_mov_b32_e32 v19, 0")
                 if shape == "ballot_empty":
@@ -255,12 +285,12 @@ def main():
                     if shape.startswith("ballot_"):
                         env["VKH_BALLOT_PASSES"] = "3"
                     if shape.startswith(("multi_", "five_")):
-                        env["VKH_BALLOT_PASSES"] = "7" if shape.startswith("five_") else "5"
+                        env["VKH_BALLOT_PASSES"] = str(chain_length + 2) if chain_length else ("7" if shape.startswith("five_") else "5")
                     rc, output = gpu.run_cmd([str(args.harness.resolve()), str(vertex), str(fragment),
                                               str(prefix.with_suffix(".raw")), str(w), str(h)], env=env)
                     if rc:
                         raise RuntimeError(output)
-                    reached.update(verify(heap, count, seed, killed, shape, nested_stride))
+                    reached.update(verify(heap, count, seed, killed, shape, nested_stride, chain_length, exports_bank))
                     print(f"PASS {name} {w}x{h} seed={seed} lanes={count}", flush=True)
             if shape:
                 required = {(a,b) for a in (False, True) for b in (False, True)} if shape.startswith("nested") else {False, True}

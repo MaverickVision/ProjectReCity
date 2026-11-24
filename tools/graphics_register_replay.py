@@ -318,9 +318,6 @@ def generate(info, stage, unsupported):
         middle = segments[1]
         index = 1
         while (split := split_masked_vote(middle, regs)) is not None:
-            # The test ABI counts visits in one four-bit nibble per draw.
-            if len(ballots) >= 7:
-                fail("at most seven ballot captures fit in the replay visit word")
             before, vote, middle = split
             segments[index:index+1] = [[Op("v_vote", ("0u",), "")] + before, middle]
             ballots.insert(index, Op(vote.dest, ("v_vote", "0u"), "!="))
@@ -361,5 +358,5 @@ def generate(info, stage, unsupported):
     template = Path(__file__).with_suffix(".glsl").read_text(encoding="ascii")
     if stage == "vs":
         template = template.replace("#version 460", "#version 460\n#define VERTEX_STAGE")
-    template = template.replace("N_BALLOTS", str(len(ballots))).replace("DATA_WORDS", str(16384 - 2 - 512 * len(ballots)) + "u")
+    template = template.replace("N_BALLOTS", str(len(ballots))).replace("DATA_WORDS", str(16384 - 2 - 512 * min(len(ballots), 7)) + "u")
     return template.replace("STRIDE", f"{6 + max(map(len,cuts))}u").replace("// GENERATED_BODY", "\n    ".join(body))

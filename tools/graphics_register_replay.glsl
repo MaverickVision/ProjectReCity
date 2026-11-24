@@ -10,6 +10,9 @@ layout(buffer_reference, std430, buffer_reference_align=4) buffer Scratch {
 layout(push_constant) uniform Params {
     uint phase, unused, count, rowWidth, seed;
     layout(offset=128) Scratch s;
+#if N_BALLOTS > 7
+    uint captures;
+#endif
 } pc;
 #ifdef VERTEX_STAGE
 layout(location=1) flat out vec4 result;
@@ -30,6 +33,9 @@ void main() {
         atomicAdd(pc.s.errors, 1u);
         return;
     }
+#if N_BALLOTS > 7
+    if (pc.captures != N_BALLOTS) { atomicAdd(pc.s.errors, 1u); return; }
+#endif
     uint key = (id + pc.phase * 37u) % pc.count;
     uint base = key * STRIDE;
     uint slot;
@@ -45,6 +51,14 @@ void main() {
         if (slot >= 16384u) { atomicAdd(pc.s.errors, 1u); return; }
     }
     uint halfID = slot >> 5, pair = halfID & ~1u;
+#if N_BALLOTS > 7
+    // Draw barriers order the phases. Detect a missing, repeated, or out-of-order visit.
+    if (atomicCompSwap(pc.s.data[base+1u], pc.phase, pc.phase+1u) != pc.phase) {
+        atomicAdd(pc.s.errors, 1u);
+        return;
+    }
+#else
     atomicAdd(pc.s.data[base+1u], 1u << (4u * pc.phase));
+#endif
     // GENERATED_BODY
 }
