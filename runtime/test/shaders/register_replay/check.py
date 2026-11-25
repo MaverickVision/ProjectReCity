@@ -17,15 +17,21 @@ MASK = 2**32 - 1
 
 def extend_chain(body, length, exports):
     # Extend the complement arm, reusing its compare pair and feeding each count forward.
+    # Retain the three exported counts. Other votes can overwrite one rolling SGPR.
+    registers = {n: 22+n for n in range(1, 6)}
+    registers.update({n: 28+i for i, n in enumerate(exports) if n > 5})
     ops = []
+    previous = registers[5]
     for index in range(6, length + 1):
         vector = "v22" if index % 2 == 0 else "v26"
-        ops += [f"v_cmp_ne_u32_e64 s[20:21], s{21+index}, {vector}",
-                f"s_bcnt1_i32_b64 s{22+index}, s[20:21]"]
-    ops.append(f"v_add_nc_u32_e32 v5, s{22+length}, v5")
+        dest = registers.get(index, 31)
+        ops += [f"v_cmp_ne_u32_e64 s[20:21], s{previous}, {vector}",
+                f"s_bcnt1_i32_b64 s{dest}, s[20:21]"]
+        previous = dest
+    ops.append(f"v_add_nc_u32_e32 v5, s{previous}, v5")
     body = body.replace("v_add_nc_u32_e32 v5, s27, v5", "\n".join(ops))
     body = body[:body.index("v_mov_b32_e32 v27, s23")]
-    return body + "\n".join(f"v_mov_b32_e32 v{27+i}, s{22+n}" for i, n in enumerate(exports))
+    return body + "\n".join(f"v_mov_b32_e32 v{27+i}, s{registers[n]}" for i, n in enumerate(exports))
 
 
 def verify(path, count, seed, killed, shape, nested_stride=None, chain_length=0, exports=()):
@@ -196,7 +202,7 @@ def main():
     ap.add_argument("--masked-ballot", action="store_true", help="check a vote under two EXEC masks")
     ap.add_argument("--multiple-ballots", action="store_true", help="check dependent votes in nested EXEC arms")
     ap.add_argument("--five-ballots", action="store_true", help="verify five dependent masked votes")
-    ap.add_argument("--long-ballots", nargs="*", type=int, choices=(6, 10, 16, 32), metavar="N",
+    ap.add_argument("--long-ballots", nargs="*", type=int, choices=(6, 10, 16, 32, 64, 128), metavar="N",
                     help="check dependent masked vote chains of the selected lengths (default: 6 and 10)")
     args = ap.parse_args()
     work = args.work.resolve()
